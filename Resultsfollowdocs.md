@@ -216,3 +216,109 @@ kubectl rollout status deployment/test
    - Node CPU usage during updates
 
 Would you like me to provide specific commands to capture these metrics quantitatively?
+
+
+----
+# Tracing eBPF/kube-proxy Without Direct Node Access
+
+Since you don't have direct node access but can create privileged pods, here's how to set up performance tracing in your EKS cluster:
+
+## Method 1: Privileged Debug Pod for Node Inspection
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: node-debugger
+  namespace: default
+spec:
+  hostNetwork: true
+  hostPID: true
+  containers:
+  - name: debugger
+    image: quay.io/cilium/debug:v1.12
+    command: ["sleep", "infinity"]
+    securityContext:
+      privileged: true
+      capabilities:
+        add: ["SYS_ADMIN", "NET_ADMIN"]
+  nodeSelector:
+    kubernetes.io/hostname: <your-target-node>  # specify node name
+```
+
+### Commands to Run Inside Debug Pod:
+
+**For kube-proxy (iptables) tracing:**
+```bash
+# Monitor iptables changes for a specific service
+watch -n 0.1 "iptables -t nat -L KUBE-SERVICES -v -n --line-numbers | grep <your-service-ip>"
+
+# Continuous logging of changes
+iptables -t nat -L KUBE-SERVICES -v -n -x > iptables-before.txt
+# After making changes
+iptables -t nat -L KUBE-SERVICES -v -n -x > iptables-after.txt
+diff -u iptables-before.txt iptables-after.txt
+```
+
+**For Cilium (eBPF) tracing:**
+```bash
+# Install bpftrace if not available
+apt-get update && apt-get install -y bpftrace
+
+# Trace service updates
+bpftrace -e 'kprobe:__cilium_lxc* { @start[tid] = nsecs; }
+              kretprobe:__cilium_lxc* { @latency = hist(nsecs - @start[tid]); }'
+```
+
+## Method 2: Using Cilium's Hubble for Observability
+
+If you have Hubble enabled:
+```bash
+# Observe real-time service updates
+kubectl exec -it <cilium-pod> -n kube-system -- hubble observe --follow --type trace
+
+# Filter for specific service
+kubectl exec -it <cilium-pod> -n kube-system -- hubble observe --follow --to-ip <service-ip>
+```
+
+## Method 3: Kubernetes Audit Logs + Metrics
+
+For control plane timing:
+```bash
+# Check kube-proxy logs
+kubectl logs -l k8s-app=kube-proxy -n kube-system --tail=50 -f
+
+# Check Cilium agent logs
+kubectl logs -l k8s-app=cilium -n kube-system --tail=50 -f
+
+# Get metrics
+kubectl exec -it <cilium-pod> -n kube-system -- cilium metrics list
+```
+
+## Scaling Test Procedure (1→44 pods):
+
+1. Prepare your privileged pod on target node
+2. In one terminal, start monitoring:
+```bash
+kubectl exec -it node-debugger -- watch -n 0.1 "iptables -t nat -L KUBE-SERVICES -v -n | grep <service-ip>"
+```
+3. In another terminal, trigger scaling:
+```bash
+date +%s.%N; kubectl scale deploy/test --replicas=44; date +%s.%N
+```
+4. Observe:
+   - Time difference between date commands = API processing time
+   - Time until iptables stabilize = dataplane propagation time
+
+## Expected Results:
+
+| Metric                | Cilium (eBPF)          | kube-proxy (iptables)   |
+|-----------------------|------------------------|-------------------------|
+| API to dataplane sync | 50-500ms total         | 5-30 seconds            |
+| Update granularity     | Per-endpoint           | Full table rewrite      |
+| CPU impact            | Minimal spike          | Significant node CPU    |
+| Connection drops      | None                   | Possible during update  |
+
+Would you like me to provide specific bpftrace scripts tailored to your service IPs for more precise measurement?
+
+
